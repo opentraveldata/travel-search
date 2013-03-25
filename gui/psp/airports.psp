@@ -1,0 +1,374 @@
+<% print "Content-Type: text/html; charset=utf-8\n\n" %>
+
+<%
+import os
+from mod_python import apache
+
+#
+local_path = '/var/www/webapps/airports'
+localize = apache.import_module('localize', path=[local_path])
+log_service = apache.import_module('log_service', path=[local_path])
+google_api_key_url = '&key=%s' % localize.google_api_key
+
+airport_service = None
+if localize.airport_service_path != '':
+	airport_service_path = localize.airport_service_path + '/api/python' 
+	airport_service = apache.import_module ('airport_service',
+						path=[airport_service_path])
+	default_airport_info = airport_service.load_info (requested_fields=['lat', 'lon', 'city_name'])
+
+# Google Maps API v3
+body_for_GMap = '<body onload="initialize()">'
+html_for_GMap = '<div id="map_canvas" style="margin-left: auto; text-align:center; margin-right: auto; width:50%; height:50%"></div>'
+coord_for_GMap_center = {'lat': 10, 'lon': 0}
+
+# Parser helpers
+def getMain(locations):
+	return locations[:3].upper()
+
+# Parse the OpenTREP compact-formatted result
+def parseCompactResult (resultString):
+	codes = []
+	form_value, unrecognized = '', ''
+	if ';' in resultString:
+		resultString, unrecognized = resultString.split(';')
+		msg = 'Unrecognised: %s. ' % unrecognized
+	if resultString != '':
+		codes = [getMain(x) for x in resultString.split(',')]
+	str_value = unrecognized
+
+	if len (codes) > 0:
+		form_value = ' '.join(codes) + ' ' + str_value
+
+	#
+	return (codes, form_value, unrecognized)
+
+# Parse the OpenTREP compact-formatted result
+def parseJSONResult (resultString):
+	codes = []
+	form_value, unrecognized = '', ''
+
+	#
+	return (codes, form_value, unrecognized)
+
+
+# Defaults
+head = ''
+body_declaration = '<body>'
+msg = ''
+form_value, original_form_value, unrecognized = '', '', ''
+default_zoom_level = 5
+zoom_level = default_zoom_level
+map_type_list = ['ROADMAP', 'SATELLITE', 'HYBRID', 'TERRAIN']
+default_map_type = map_type_list[0] 
+map_type_value = default_map_type
+
+language = 'en'
+result = False
+list_markers = []
+
+# Parsing: recognise sequence of three-letter codes
+codes = []
+locations = []
+alter_locations = []
+
+# Detect the required action
+if form.has_key('query_text'):
+	form_value = form['data']
+	if form.has_key('zoom'):
+		zoom_level = form['zoom']
+	if zoom_level != '':
+		zoom_level = int(zoom_level)
+	if zoom_level <= 0 or zoom_level > 20:
+		zoom_level = default_zoom_level
+	if form.has_key('map_type'):
+		map_type_value = form['map_type']
+	if not map_type_value in map_type_list:
+		map_type_value = default_map_type
+	result = True
+elif form.has_key('show_airport'):
+	codes = [airport_service.get_random_airport (default_airport_info)]
+	form_value = ' '.join(codes)
+	result = True
+elif form.has_key('show_itinerary'):
+	codes = [airport_service.get_random_airport (default_airport_info) for i in range(3)]
+	form_value = ' '.join(codes)
+	result = True
+
+# Save the query,as entered by the user
+original_form_value = form_value
+
+if (form.has_key('query_text') and form_value.rstrip(' ') == ''):
+	pass
+else:
+	# Try a sequence of three-letter codes separated by blanks
+	potential_three_letter_codes = form_value.upper().strip(' ').split(' ')
+	flag_sequence_of_three_letter_codes = True
+	for potential_three_letter_code in potential_three_letter_codes:
+		if len(potential_three_letter_code) != 3:
+			flag_sequence_of_three_letter_codes = False
+	if flag_sequence_of_three_letter_codes:
+		codes = potential_three_letter_codes
+
+	else:
+		# Use OpenTREP
+		libpyopentrep_proxy = apache.import_module ('libpyopentrep_proxy', 
+							    path=[local_path])
+		libpyopentrep = libpyopentrep_proxy.import_libpyopentrep(localize.libpyopentrep_path)
+		mySearch = libpyopentrep.OpenTrepSearcher()
+		mySearch.init (localize.traveldb_path, localize.tmp_trep_log_filename)
+
+		outputFormat = 'S'
+		str_codes = mySearch.search (outputFormat, form_value)
+		codes, form_value, unrecognized = parseCompactResult (str_codes)
+
+		# Release the OpenTREP library resource
+		mySearch.finalize()
+		
+	
+# Logging
+if form.has_key ('data'):
+	log_service.log (localize.www_log_filename, req, form['data'], codes,
+			 unrecognized)
+os.system ('cat %s >> %s' % (localize.tmp_trep_log_filename, 
+			     localize.trep_log_filename))
+		
+# Calling appropriate program (nothing, coordinates, or distance)
+n_airports = len (codes)
+map_display = apache.import_module ('map_display', path=[local_path])
+
+##
+# Re-state the initial query
+##
+msg += '<center>Original query: "%s"</center><br>' % original_form_value
+
+##
+# No airport (=> no map)
+##
+if n_airports == 0:
+	if (result == True):
+		msg += '<center>'
+		msg += 'Your entry ("%s") was not recognised:<br>' % original_form_value
+		msg += 'Enter a three-letter code or the name of an airport or city to find out its coordinates (e.g., JFK, or Rio de Janeiro)<br>'
+		msg += 'Enter a sequence of two three-letter codes or names to find out the distance between those airports (e.g., JFK CDG Tokyo)'
+		msg += '</center>'
+
+##
+# Some airports have been given, but the (Python) airport_service can not be
+# found. The path for that service is specified within the localize.py file.
+##
+elif localize.airport_service_path == '':
+	if (result == True):
+		msg += '<center>'
+		msg += 'Configuration problem: could not find required airport info.'
+		msg += '</center>'
+
+##
+# A single airport => a map with a single marker
+##
+elif n_airports == 1:
+	apt = codes[0]
+	coord = airport_service.get_lat_lon (apt, default_airport_info)
+	if coord is None:
+		msg += 'Unknown: ' + apt
+	else:
+		coord_for_GMap_center = {'lat': coord[0], 'lon': coord[1]}
+		city_name = airport_service.get_city_name (apt, default_airport_info)
+		msg += map_display.create_msg_coordinates (apt, city_name)
+		aptMarker = map_display.create_marker (apt, coord[0],
+						       coord[1], city_name)
+		list_markers = [aptMarker]
+		body_declaration = body_for_GMap
+
+##
+# Several airports => a map with several paths (and markers)
+##
+elif n_airports >= 2:
+	import scipy
+	list_unknown, list_polylines = [], []
+	list_distances, list_cities = [], []
+
+	# Markers
+	for apt in codes:
+		coord = airport_service.get_lat_lon (apt, default_airport_info)
+		if coord is None: list_unknown.append(apt)
+		else:
+			city_name = airport_service.get_city_name (apt, default_airport_info)
+			list_cities.append (city_name)
+			aptMarker = map_display.create_marker (apt,
+							       coord[0], 
+							       coord[1], 
+							       city_name)
+			list_markers.append (aptMarker)
+
+	if len (list_unknown) > 0:
+		msg += 'unknown: ' + ', '.join(list_unknown)
+	else:
+		for (apt1, apt2) in zip (codes[:-1], codes[1:]):
+			dist, unknown = airport_service.get_distance_km (apt1, apt2,
+									 default_airport_info)
+			list_distances.append(dist)
+			polyline = {'color': '#ff0000', 'width': 2}
+			for (str_i, apt) in zip(('1', '2'), (apt1, apt2)):
+				coord = airport_service.get_lat_lon (apt, default_airport_info)
+				polyline[str_i] = {'lat': coord[0], 'lon': coord[1]}
+			list_polylines.append(polyline)
+
+		msg += map_display.create_msg_distance (list_distances, codes,
+							list_cities)
+		body_declaration = body_for_GMap
+
+# Do not forget to leave a non-indented line here, otherwise the following
+# will be output only when the last of the above conditions holds true.
+%>
+
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="<%= language %>"
+      lang="<%= language %>">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/> 
+  <style type="text/css">
+    html { height: 100% }
+    body { height: 100%; margin: 0; padding: 0 }
+    #map_canvas { margin-left: auto; text-align:center; margin-right: auto; width:50%; height:50% }
+  </style>
+  <script type="text/javascript"
+          src="http://maps.googleapis.com/maps/api/js?sensor=false<%= google_api_key_url %>"></script>
+  <script type="text/javascript">
+    var map;
+    function initialize() {
+      var placePoint = new google.maps.LatLng (<%= coord_for_GMap_center['lat'] %>, 
+					       <%= coord_for_GMap_center['lon'] %>);
+      var myOptions = {
+        zoom: <%= zoom_level%>,
+        center: placePoint,
+        mapTypeId: google.maps.MapTypeId.<%= map_type_value%>
+      }
+      map = new google.maps.Map (document.getElementById("map_canvas"), myOptions);
+    
+      // Markers and map bounds
+      var bounds = new google.maps.LatLngBounds();
+<%
+nbOfMarkers = len(list_markers)
+for marker in list_markers:
+%>
+      placePoint = new google.maps.LatLng (<%= marker['lat'] %>, <%= marker['lon'] %>);
+      var marker = new google.maps.Marker ({ 
+        position: placePoint,
+        title: "<%= marker['name'] %>",
+        map: map,
+      });
+
+      //
+      bounds.extend (placePoint);
+
+      // Fit the map with the newly calculated bounds
+<%
+if (nbOfMarkers >= 2):
+%>
+      map.fitBounds (bounds);
+<%
+#
+%>
+
+      // Polyline
+      var flightPlanCoordinates = [
+<%
+commaStr = ','
+idx = 0
+for marker in list_markers:
+	idx += 1
+	if (idx == nbOfMarkers): commaStr = ''
+%>
+        new google.maps.LatLng (<%= marker['lat'] %>, <%= marker['lon'] %>) <%= commaStr %>
+<%
+%>
+      ];
+
+      var flightPath = new google.maps.Polyline({
+        path: flightPlanCoordinates,
+        strokeColor: "#FF0000",
+        strokeOpacity: 1.0,
+        strokeWeight: 2
+      });
+
+      flightPath.setMap (map);
+    }
+  </script>
+  <title>Airports</title>
+</head>
+
+<%= body_declaration %>
+
+<%
+%>
+    <center>
+      <br clear="all" id="lgpd">
+      <img id="logo" alt="Search Airports" height="110" width="276"
+           src="/icons/airports.gif">
+      <br><br>
+      <form action="airports.psp" method="post" name="f">
+        <table cellpadding=0 cellspacing=0>
+          <tr valign=top>
+            <td width="25%">&nbsp;</td>
+            <td align="center" nowrap>
+              <input type="text" name="data" autocomplete="off"
+				 maxlength="2048" size="55" title="Airport Search" 
+	             value="<%= form_value%>" class="lst">
+			  <input type="hidden" name="zoom" value="<%= zoom_level%>">
+			  <input type="hidden" name="map_type" value="<%= map_type_value%>"
+              <br>
+              <input name="query_text" type="submit" value="Search Airports"
+	             class="lsb">
+              <input name="show_airport" type="submit" value="Show an Airport!"
+	             class="lsb">
+              <input name="show_itinerary" type="submit" 
+	             value="Show an Itinerary!" class="lsb">
+            </td>
+            <td nowrap width="25%" align="left">&nbsp;</td>
+          </tr>
+        </table>
+      </form>
+    </center>
+
+    <br><br>
+
+<%
+# No entry has been submitted yet. So, no map is displayed.
+if (result == False):
+%>
+    <center>
+      <font size=-1>
+        <a href="airports.psp">About Search-Airports</a>
+      </font>
+      <p><font size=-2>
+        &copy;2009-2012 - <a href="#">Privacy</a>
+      </font></p>
+    </center>
+
+<%
+# A user entry has been submitted. A Google Map is therefore displayed.
+else:
+%>
+    <center>
+      <p><font size="-1"><%= msg %></font></p>
+    </center>
+<%
+	# The following HTML <div> (Google Maps API v3) must not be enclosed by
+	# <center> tags, as it would not be able to display correctly otherwise.
+%>
+    <%= html_for_GMap %>
+
+    <center>
+      <p><font size="-2">
+        &copy;2009-2013 - <a href="#">Privacy</a> - 
+        <a href="#">About Search-Airports</a>
+      </font>
+    </center>
+<%
+# Endof the Python part. It should not be removed.
+%>
+
+</body>
+</html>
+
